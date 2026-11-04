@@ -18,6 +18,7 @@ if not TOKEN:
 
 guild = discord.Object(id=GUILD_ID)
 
+# Necesario para detectar ?afk, ?avatar y mensajes normales.
 intents = discord.Intents.default()
 intents.guild_messages = True
 intents.message_content = True
@@ -26,6 +27,7 @@ client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 afk_users = {}
+active_number_games = {}
 
 
 def formato_duracion(segundos):
@@ -104,7 +106,8 @@ async def ayuda(interaction: discord.Interaction):
         "• `/afk` — activa tu estado AFK\n"
         "• `/avatar usuario` — muestra avatar y banner del usuario\n"
         "• `/sorteo ganadores duracion premio` — crea un sorteo\n"
-        "• `/cookie game` — juego de galleta con cuenta atrás\n"
+        "• `/cookie game` — juego de la galleta\n"
+        "• `/número numero` — elige un número secreto entre 1 y 200\n"
         "• `/anuncio mensaje` — publica un anuncio"
     )
 
@@ -300,24 +303,21 @@ async def sorteo(
 
 class CookieGameView(discord.ui.View):
     def __init__(self):
-        super().__init__(timeout=120)
-        self.started = False
+        super().__init__(timeout=60)
         self.finished = False
         self.lock = asyncio.Lock()
-
         self.message = None
-        self.winner = None
 
-        self.button = discord.ui.Button(
-            label="🍪",
-            style=discord.ButtonStyle.success,
-            disabled=True,
-        )
-        self.add_item(self.button)
-
-        self.button.callback = self.inc_button
-
-    async def inc_button(self, interaction: discord.Interaction):
+    @discord.ui.button(
+        label="🍪",
+        style=discord.ButtonStyle.success,
+        custom_id="cookie_game:click",
+    )
+    async def click_cookie(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ):
         async with self.lock:
             if self.finished:
                 await interaction.response.send_message(
@@ -326,16 +326,8 @@ class CookieGameView(discord.ui.View):
                 )
                 return
 
-            if not self.started:
-                await interaction.response.send_message(
-                    "¡Espera a que la cuenta regresiva llegue a 0!",
-                    ephemeral=True,
-                )
-                return
-
             self.finished = True
-            self.winner = interaction.user
-            self.button.disabled = True
+            button.disabled = True
 
             await interaction.response.edit_message(
                 content=f"🍪 {interaction.user.mention} tocó la galleta primero y ganó.",
@@ -343,41 +335,79 @@ class CookieGameView(discord.ui.View):
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
-    async def start(self):
-        for cuenta in range(5, -1, -1):
-            if cuenta == 0:
-                self.started = True
-                self.button.disabled = False
-                await self.message.edit(
-                    content="🍪 ¡La galleta apareció! **0** — ¡púlsala primero!",
-                    view=self,
-                )
-            else:
-                await self.message.edit(
-                    content=f"🍪 La galleta aparece en **{cuenta}**…",
-                    view=self,
-                )
-            await asyncio.sleep(1)
+    async def on_timeout(self):
+        if self.finished:
+            return
 
-        await asyncio.sleep(1)
-        if not self.finished:
-            self.finished = True
-            self.button.disabled = True
+        self.finished = True
+        for item in self.children:
+            item.disabled = True
+
+        if self.message:
             await self.message.edit(
                 content="⏰ Se acabó el tiempo: nadie tocó la galleta.",
                 view=self,
             )
 
 
-@tree.command(name="cookie", description="Juego de la cookie", guild=guild)
+@tree.command(name="cookie", description="Juego de la galleta", guild=guild)
 async def cookie_game(interaction: discord.Interaction):
     vista = CookieGameView()
-    await interaction.response.send_message(
-        "🍪 La galleta aparece en **5**…",
+
+    await interaction.response.send_message("La galleta aparece en **5**…")
+    mensaje = await interaction.original_response()
+    vista.message = mensaje
+
+    for cuenta in range(4, 0, -1):
+        await asyncio.sleep(1)
+        await mensaje.edit(content=f"La galleta aparece en **{cuenta}**…")
+
+    await asyncio.sleep(1)
+    await mensaje.edit(
+        content="🍪 ¡Apareció la galleta! ¡Tócala primero!",
         view=vista,
     )
-    vista.message = await interaction.original_response()
-    asyncio.create_task(vista.start())
+
+
+@tree.command(
+    name="número",
+    description="Piensa un número para que los demás lo adivinen",
+    guild=guild,
+)
+@app_commands.describe(numero="El número secreto, entre 1 y 200")
+async def numero_game(
+    interaction: discord.Interaction,
+    numero: app_commands.Range[int, 1, 200],
+):
+    if interaction.guild_id is None or interaction.channel is None:
+        await interaction.response.send_message(
+            "Este comando solo se puede usar dentro de un servidor.",
+            ephemeral=True,
+        )
+        return
+
+    if interaction.guild_id in active_number_games:
+        await interaction.response.send_message(
+            "Ya hay una partida activa en este servidor. Espera a que alguien la adivine.",
+            ephemeral=True,
+        )
+        return
+
+    active_number_games[interaction.guild_id] = {
+        "numero": numero,
+        "autor_id": interaction.user.id,
+    }
+
+    await interaction.response.send_message(
+        "Partida iniciada. El número elegido no se mostrará en este mensaje.",
+        ephemeral=True,
+    )
+
+    await interaction.channel.send(
+        f"🎲 {interaction.user.mention} está pensando en un número del 1 al 200. "
+        "¡Adivínenlo antes que los demás!",
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 @tree.command(name="anuncio", description="Envía un anuncio importante", guild=guild)
@@ -468,6 +498,29 @@ async def on_message(message: discord.Message):
 
         await message.channel.send(embed=embed)
         return
+
+    # JUEGO DE ADIVINAR EL NÚMERO
+    partida = active_number_games.get(message.guild.id)
+    if partida and message.content.isdigit():
+        numero_adivinado = int(message.content)
+
+        if (
+            numero_adivinado >= 1
+            and numero_adivinado <= 200
+            and message.author.id != partida["autor_id"]
+            and numero_adivinado == partida["numero"]
+        ):
+            autor = message.guild.get_member(partida["autor_id"])
+            autor_mention = autor.mention if autor else "El usuario"
+
+            active_number_games.pop(message.guild.id, None)
+
+            await message.channel.send(
+                f"🎉 ¡Felicidades {message.author.mention}! "
+                f"{autor_mention} estaba pensando el número **{partida['numero']}**.",
+                allowed_mentions=discord.AllowedMentions.users(),
+            )
+            return
 
     for usuario in message.mentions:
         clave_usuario = (message.guild.id, usuario.id)
