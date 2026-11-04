@@ -39,12 +39,8 @@ def normalize(text: str) -> str:
 
 
 def duration_seconds(text: str) -> Optional[int]:
-    """Accept 1m, 1h, 1d, 1mon, 1year, and Spanish equivalents."""
     value = normalize(text.strip())
-    match = re.fullmatch(
-        r"(\d+)\s*(m|min|mins|minuto|minutos|h|hr|hrs|hora|horas|d|dia|dias|mon|month|mes|meses|year|yr|ano|anos)",
-        value,
-    )
+    match = re.fullmatch(r"(\d+)\s*(m|min|mins|minuto|minutos|h|hr|hrs|hora|horas|d|dia|dias|mon|month|mes|meses|year|yr|ano|anos)", value)
     if not match or int(match.group(1)) < 1:
         return None
     count, unit = int(match.group(1)), match.group(2)
@@ -301,19 +297,23 @@ async def avatar_command(interaction, usuario: discord.Member):
 
 class LuckView(discord.ui.View):
     def __init__(self, question):
-        super().__init__(timeout=120)
+        super().__init__(timeout=None)
         self.question = question
-        self.used = False
 
     @discord.ui.button(label="🍀 Suerte", style=discord.ButtonStyle.success, custom_id="juego_suerte:button")
-    async def luck(self, interaction, button):
-        if self.used:
-            await interaction.response.send_message("Este botón ya se usó.", ephemeral=True)
-            return
-        self.used = True
-        button.disabled = True
+    async def luck(self, interaction: discord.Interaction, button: discord.ui.Button):
         result = random.choice(("¡Sí!", "No esta vez."))
-        await interaction.response.edit_message(content=f"🍀 {interaction.user.mention}, tu suerte dice: **{result}**\nPregunta: {self.question}", view=self, allowed_mentions=discord.AllowedMentions.none())
+        response = (
+            f"🍀 {interaction.user.mention}, tu suerte dice: **{result}**\n"
+            f"Pregunta: {self.question}"
+        )
+        # Public followup: each click gets its own visible message, and the original
+        # button stays enabled for every member to use independently.
+        await interaction.response.send_message(
+            response,
+            ephemeral=False,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
 
 juego_group = app_commands.Group(name="juego", description="Juegos de suerte")
@@ -326,7 +326,11 @@ async def juego_button(interaction, mensaje: str):
     if not mensaje or len(mensaje) > 500:
         await interaction.response.send_message("Escribe un mensaje de 1 a 500 caracteres.", ephemeral=True)
         return
-    await interaction.response.send_message(f"Mira tu suerte en el botón **🍀 Suerte**: 50% sí y 50% no.\nPregunta: {mensaje}", view=LuckView(mensaje), allowed_mentions=discord.AllowedMentions.none())
+    await interaction.response.send_message(
+        f"Mira tu suerte en el botón **🍀 Suerte**: 50% sí y 50% no.\nPregunta: {mensaje}",
+        view=LuckView(mensaje),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 tree.add_command(juego_group, guild=GUILD)
@@ -470,7 +474,6 @@ async def apply_timeout_response(interaction, usuario, duracion):
         await audit(interaction.guild, "Miembro aislado", f"**Miembro:** {usuario.mention}\n**Moderador:** {interaction.user.mention}\n**Duración:** {duracion}", discord.Color.red())
 
 
-# Group constructor has no `guild` parameter in discord.py. Bind its guild on tree.add_command.
 time_group = app_commands.Group(name="time", description="Comandos de aislamiento")
 
 
