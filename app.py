@@ -24,22 +24,25 @@ intents.message_content = True
 intents.members = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
-
-# Runtime settings; ticket-owner IDs are also saved in channel topics for recovery.
 CONFIG_FILE = Path("bot_config.json")
-config = {"ticket_role": {}, "ticket_category": {}, "ticket_log": {}, "ticket_panel": {}, "audit_log": {}, "blocked_words": {}, "autorole": {}}
+CONFIG_DEFAULTS = {
+    "ticket_role": {}, "ticket_category": {}, "ticket_log": {}, "audit_log": {},
+    "autorole": {}, "blocked_words": {}, "antispam": {}, "antilink": {},
+}
+config = {key: {} for key in CONFIG_DEFAULTS}
 afk_users = {}
 active_number_games = {}
 invite_cache = {}
 invite_counts = {}
+spam_records = {}
 number_game_lock = asyncio.Lock()
 
 
 def load_config():
     try:
         saved = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        for key in config:
-            if key in saved and isinstance(saved[key], dict):
+        for key in CONFIG_DEFAULTS:
+            if isinstance(saved.get(key), dict):
                 config[key] = saved[key]
     except (OSError, json.JSONDecodeError):
         pass
@@ -89,16 +92,6 @@ def duration_label(seconds: int) -> str:
     return f"{seconds // 60} minuto(s)"
 
 
-def elapsed_label(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    parts = []
-    for name, amount in (("día", 86400), ("hora", 3600), ("minuto", 60), ("segundo", 1)):
-        value, seconds = divmod(seconds, amount)
-        if value:
-            parts.append(f"{value} {name if value == 1 else name + 's'}")
-    return ", ".join(parts) or "0 segundos"
-
-
 def get_role(guild, setting):
     role_id = config[setting].get(str(guild.id))
     return guild.get_role(int(role_id)) if role_id else None
@@ -109,29 +102,39 @@ def get_channel(guild, setting):
     return guild.get_channel(int(channel_id)) if channel_id else None
 
 
-async def post_ticket_log(guild, title, description, color=discord.Color.blurple()):
-    channel = get_channel(guild, "ticket_log")
-    if channel:
-        embed = discord.Embed(title=title, description=description[:4000], color=color, timestamp=datetime.now(timezone.utc))
-        try:
-            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-        except (discord.Forbidden, discord.HTTPException) as error:
-            print(f"No se pudo escribir en ticket-logs: {error}")
+def is_admin_or_owner(member):
+    return isinstance(member, discord.Member) and (
+        member.id == member.guild.owner_id or member.guild_permissions.administrator
+    )
+
+
+def is_ticket_staff(member):
+    if not isinstance(member, discord.Member):
+        return False
+    if is_admin_or_owner(member) or member.guild_permissions.manage_guild:
+        return True
+    role = get_role(member.guild, "ticket_role")
+    return role is not None and role in member.roles
 
 
 async def audit(guild, title, description, color=discord.Color.orange()):
     channel = get_channel(guild, "audit_log")
-    if channel is None:
-        channel = discord.utils.get(guild.text_channels, name="auditoria-logs")
-        if channel:
-            config["audit_log"][str(guild.id)] = channel.id
-            save_config()
     if channel:
         embed = discord.Embed(title=title, description=(description or "Sin detalles")[:4000], color=color, timestamp=datetime.now(timezone.utc))
         try:
             await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
         except (discord.Forbidden, discord.HTTPException) as error:
             print(f"No se pudo escribir en auditoria-logs: {error}")
+
+
+async def ticket_log(guild, title, description, color=discord.Color.blurple()):
+    channel = get_channel(guild, "ticket_log")
+    if channel:
+        embed = discord.Embed(title=title, description=description[:4000], color=color, timestamp=datetime.now(timezone.utc))
+        try:
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except (discord.Forbidden, discord.HTTPException) as error:
+            print(f"No se pudo escribir en los logs de tickets: {error}")
 
 
 async def audit_executor(guild, action, target_id):
@@ -144,27 +147,20 @@ async def audit_executor(guild, action, target_id):
     return None, None
 
 
-def is_ticket_staff(member):
-    if not isinstance(member, discord.Member):
-        return False
-    if member.guild_permissions.administrator or member.guild_permissions.manage_guild:
-        return True
-    support_role = get_role(member.guild, "ticket_role")
-    return support_role is not None and support_role in member.roles
-
-
 async def timeout_member(guild, actor, target, seconds):
     if not isinstance(actor, discord.Member):
         return "Este comando solo se puede usar en un servidor."
-    if not (actor.id == guild.owner_id or actor.guild_permissions.administrator or is_ticket_staff(actor)):
-        return "Necesitas ser administrador, propietario o tener el rol de soporte/silenciador."
+    # The server owner and administrators can always run it; support-role members
+    # may also use it, as configured for the ticket/moderation staff.
+    if not (is_admin_or_owner(actor) or is_ticket_staff(actor)):
+        return "Necesitas ser administrador, propietario o tener el rol del equipo de soporte."
     if seconds is None or seconds < 60:
         return "Duración no válida. Usa `12m`, `1h`, `1d`, `1mon` o `1year` (mínimo 1m)."
     if seconds > 28 * 86400:
         return "Discord limita el aislamiento a 28 días. Usa una duración de `28d` o menos."
     if target.bot or target.id in (guild.owner_id, actor.id):
         return "No puedes aislar a bots, al propietario ni a ti mismo."
-    if actor.id != guild.owner_id and not actor.guild_permissions.administrator and target.top_role >= actor.top_role:
+    if not is_admin_or_owner(actor) and target.top_role >= actor.top_role:
         return "No puedes aislar a alguien con un rol igual o superior al tuyo."
     bot_member = guild.me
     if bot_member is None or not bot_member.guild_permissions.moderate_members:
@@ -172,8 +168,7 @@ async def timeout_member(guild, actor, target, seconds):
     if target.top_role >= bot_member.top_role:
         return "El rol del miembro está por encima o al mismo nivel que el rol del bot."
     try:
-        until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
-        await target.timeout(until, reason=f"Aislamiento aplicado por {actor}")
+        await target.timeout(datetime.now(timezone.utc) + timedelta(seconds=seconds), reason=f"Aislamiento aplicado por {actor}")
         return f"🔇 {target.mention} quedó aislado durante **{duration_label(seconds)}**."
     except discord.Forbidden:
         return "Discord rechazó el aislamiento. Revisa Moderar miembros y la jerarquía de roles."
@@ -239,30 +234,26 @@ async def avatar_embed(user):
 def server_info_embed(guild):
     text_count = sum(isinstance(ch, discord.TextChannel) for ch in guild.channels)
     voice_count = sum(isinstance(ch, (discord.VoiceChannel, discord.StageChannel)) for ch in guild.channels)
-    forum_count = sum(isinstance(ch, discord.ForumChannel) for ch in guild.channels)
     category_count = sum(isinstance(ch, discord.CategoryChannel) for ch in guild.channels)
-    embed = discord.Embed(title=f"Información de {guild.name}", color=discord.Color.blurple(), timestamp=datetime.now(timezone.utc))
+    embed = discord.Embed(title=f"Información de {guild.name}", color=discord.Color.blurple())
     if guild.icon:
         embed.set_thumbnail(url=guild.icon.url)
     embed.add_field(name="Servidor", value=f"ID: `{guild.id}`\nPropietario: <@{guild.owner_id}>\nCreado: <t:{int(guild.created_at.timestamp())}:F>", inline=False)
     embed.add_field(name="Miembros", value=f"Total: **{guild.member_count or 0}**\nBots en caché: **{sum(member.bot for member in guild.members)}**", inline=True)
-    embed.add_field(name="Canales", value=f"Texto: **{text_count}**\nVoz/escenario: **{voice_count}**\nForos: **{forum_count}**\nCategorías: **{category_count}**", inline=True)
-    embed.add_field(name="Roles y recursos", value=f"Roles: **{len(guild.roles)}**\nEmojis: **{len(guild.emojis)}**\nStickers: **{len(guild.stickers)}**", inline=True)
+    embed.add_field(name="Canales", value=f"Texto: **{text_count}**\nVoz/escenario: **{voice_count}**\nCategorías: **{category_count}**", inline=True)
+    embed.add_field(name="Roles", value=f"**{len(guild.roles)}**", inline=True)
     embed.add_field(name="Boosts", value=f"Nivel: **{guild.premium_tier}**\nBoosts: **{guild.premium_subscription_count or 0}**", inline=True)
-    embed.add_field(name="Seguridad", value=f"Verificación: **{guild.verification_level}**\nFiltro de contenido: **{guild.explicit_content_filter}**\nMFA moderadores: **{'Sí' if guild.mfa_level else 'No'}**", inline=True)
-    embed.add_field(name="Otros", value=f"Idioma: **{guild.preferred_locale}**\nDescripción: **{guild.description or 'Sin descripción'}**", inline=False)
+    embed.add_field(name="Verificación", value=f"**{guild.verification_level}**", inline=True)
     return embed
 
 
 def user_info_embed(member):
     roles = [role.mention for role in reversed(member.roles) if not role.is_default()]
-    permissions = [label for key, label in (("administrator", "Administrador"), ("manage_guild", "Gestionar servidor"), ("manage_messages", "Gestionar mensajes"), ("kick_members", "Expulsar miembros"), ("ban_members", "Banear miembros"), ("moderate_members", "Moderar miembros")) if getattr(member.guild_permissions, key, False)]
     embed = discord.Embed(title=f"Información de {member}", color=member.color if member.color.value else discord.Color.blurple())
     embed.set_thumbnail(url=member.display_avatar.url)
     embed.add_field(name="Cuenta", value=f"ID: `{member.id}`\nBot: **{'Sí' if member.bot else 'No'}**\nCreada: <t:{int(member.created_at.timestamp())}:F>", inline=False)
-    embed.add_field(name="En este servidor", value=f"Entró: {f'<t:{int(member.joined_at.timestamp())}:F>' if member.joined_at else 'Desconocido'}\nApodo: **{member.nick or 'Ninguno'}**\nRol más alto: {member.top_role.mention}", inline=False)
+    embed.add_field(name="Servidor", value=f"Entró: {f'<t:{int(member.joined_at.timestamp())}:F>' if member.joined_at else 'Desconocido'}\nApodo: **{member.nick or 'Ninguno'}**\nRol más alto: {member.top_role.mention}", inline=False)
     embed.add_field(name=f"Roles ({len(roles)})", value=", ".join(roles)[:1024] or "Ninguno", inline=False)
-    embed.add_field(name="Permisos clave", value=", ".join(permissions) or "Sin permisos destacados", inline=False)
     if member.timed_out_until:
         embed.add_field(name="Aislamiento", value=f"Hasta <t:{int(member.timed_out_until.timestamp())}:F>", inline=False)
     return embed
@@ -276,12 +267,12 @@ class TicketPanelView(discord.ui.View):
     async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         guild = interaction.guild
         if guild is None or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Este panel solo funciona en el servidor.", ephemeral=True)
+            await interaction.response.send_message("Este panel solo funciona en un servidor.", ephemeral=True)
             return
-        category = get_channel(guild, "ticket_category")
+        category = guild.get_channel(int(config["ticket_category"].get(str(guild.id), 0)))
         support_role = get_role(guild, "ticket_role")
         if not isinstance(category, discord.CategoryChannel) or support_role is None:
-            await interaction.response.send_message("El sistema de tickets aún no está configurado. Avisa a un administrador.", ephemeral=True)
+            await interaction.response.send_message("El sistema de tickets aún no está configurado.", ephemeral=True)
             return
         for existing in category.text_channels:
             if existing.topic and f"ticket_owner:{interaction.user.id}" in existing.topic:
@@ -298,23 +289,13 @@ class TicketPanelView(discord.ui.View):
             bot_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_channels=True, manage_messages=True),
         }
         try:
-            channel = await guild.create_text_channel(
-                name=f"ticket-{interaction.user.name}"[:90],
-                category=category,
-                overwrites=overwrites,
-                topic=f"ticket_owner:{interaction.user.id}",
-                reason=f"Ticket abierto por {interaction.user}",
-            )
+            channel = await guild.create_text_channel(name=f"ticket-{interaction.user.name}"[:90], category=category, overwrites=overwrites, topic=f"ticket_owner:{interaction.user.id}", reason=f"Ticket abierto por {interaction.user}")
         except (discord.Forbidden, discord.HTTPException) as error:
             await interaction.response.send_message(f"No pude crear el ticket: {error}", ephemeral=True)
             return
         await interaction.response.send_message(f"Ticket creado: {channel.mention}", ephemeral=True)
-        await channel.send(
-            f"{interaction.user.mention} {support_role.mention}, cuéntanos cómo podemos ayudarte.",
-            view=TicketCloseView(),
-            allowed_mentions=discord.AllowedMentions(users=True, roles=True),
-        )
-        await post_ticket_log(guild, "Ticket abierto", f"**Abierto por:** {interaction.user.mention} (`{interaction.user.id}`)\n**Canal:** {channel.mention}", discord.Color.green())
+        await channel.send(f"{interaction.user.mention} {support_role.mention}, cuéntanos cómo podemos ayudarte.", view=TicketCloseView(), allowed_mentions=discord.AllowedMentions(users=True, roles=True))
+        await ticket_log(guild, "Ticket abierto", f"**Abierto por:** {interaction.user.mention}\n**Canal:** {channel.mention}", discord.Color.green())
 
 
 class TicketCloseView(discord.ui.View):
@@ -323,8 +304,7 @@ class TicketCloseView(discord.ui.View):
 
     @discord.ui.button(label="🔒 Cerrar ticket", style=discord.ButtonStyle.danger, custom_id="support_ticket:close")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        channel = interaction.channel
-        guild = interaction.guild
+        channel, guild = interaction.channel, interaction.guild
         if guild is None or not isinstance(channel, discord.TextChannel) or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message("No pude identificar este ticket.", ephemeral=True)
             return
@@ -334,7 +314,7 @@ class TicketCloseView(discord.ui.View):
             await interaction.response.send_message("Solo quien abrió el ticket o el equipo de soporte puede cerrarlo.", ephemeral=True)
             return
         await interaction.response.send_message("Cerrando el ticket…", ephemeral=True)
-        await post_ticket_log(guild, "Ticket cerrado", f"**Cerrado por:** {interaction.user.mention} (`{interaction.user.id}`)\n**Abierto por:** <@{owner_id}>\n**Canal:** `#{channel.name}` (`{channel.id}`)", discord.Color.red())
+        await ticket_log(guild, "Ticket cerrado", f"**Cerrado por:** {interaction.user.mention}\n**Abierto por:** <@{owner_id}>\n**Canal:** `#{channel.name}` (`{channel.id}`)", discord.Color.red())
         try:
             await channel.delete(reason=f"Ticket cerrado por {interaction.user}")
         except (discord.Forbidden, discord.HTTPException) as error:
@@ -342,13 +322,13 @@ class TicketCloseView(discord.ui.View):
 
 
 @tree.command(name="ping", description="Comprueba si el bot responde", guild=GUILD)
-async def ping(interaction: discord.Interaction):
+async def ping(interaction):
     await interaction.response.send_message("¡Pong! ✅")
 
 
-@tree.command(name="ayuda", description="Muestra los comandos disponibles", guild=GUILD)
-async def ayuda(interaction: discord.Interaction):
-    await interaction.response.send_message("Tickets: `/ticket-panel canal descripcion`, `/ticket-rol rol`, `/ticket-categoria categoria`, `/ticket-rol-elimimar rol`, `/setlog-ticket`. Moderación: `/time out usuario duracion`. Información: `/serverinfo`, `/infoserver`, `/userinfo`. También están `/juego button` y los demás comandos del bot.", ephemeral=True)
+@tree.command(name="ayuda", description="Muestra comandos disponibles", guild=GUILD)
+async def ayuda(interaction):
+    await interaction.response.send_message("Tickets: `/ticket-panel`, `/ticket-rol`, `/ticket-categoria`, `/ticket-rol-elimimar`, `/setlog-tickets`, `/unsetlog-tickets`. Seguridad: `/antispam`, `/antilink`, `/setlog`, `/unsetlog`. Moderación: `/time out usuario duracion`.", ephemeral=True)
 
 
 @tree.command(name="serverinfo", description="Muestra información del servidor", guild=GUILD)
@@ -410,7 +390,7 @@ async def ticket_role_remove_command(interaction: discord.Interaction, rol: disc
         return
     config["ticket_role"].pop(key, None)
     save_config()
-    await interaction.response.send_message(f"✅ {rol.mention} ya no puede ver tickets nuevos.", ephemeral=True)
+    await interaction.response.send_message(f"✅ {rol.mention} ya no podrá ver tickets nuevos.", ephemeral=True)
 
 
 @tree.command(name="ticket-panel", description="Publica un panel para abrir tickets", guild=GUILD)
@@ -420,7 +400,9 @@ async def ticket_panel_command(interaction: discord.Interaction, canal: discord.
     if interaction.guild is None or not interaction.user.guild_permissions.manage_guild:
         await interaction.response.send_message("Necesitas Administrar servidor.", ephemeral=True)
         return
-    if get_role(interaction.guild, "ticket_role") is None or not isinstance(get_channel(interaction.guild, "ticket_category"), discord.CategoryChannel):
+    category_id = config["ticket_category"].get(str(interaction.guild.id))
+    category = interaction.guild.get_channel(int(category_id)) if category_id else None
+    if get_role(interaction.guild, "ticket_role") is None or not isinstance(category, discord.CategoryChannel):
         await interaction.response.send_message("Primero configura `/ticket-rol` y `/ticket-categoria`.", ephemeral=True)
         return
     embed = discord.Embed(title="🎫 Soporte", description=(descripcion or "Pulsa el botón para crear un ticket privado con el equipo de soporte.")[:4000], color=discord.Color.blurple())
@@ -434,7 +416,7 @@ async def ticket_panel_command(interaction: discord.Interaction, canal: discord.
     await interaction.response.send_message(f"✅ Panel de tickets enviado a {canal.mention}.", ephemeral=True)
 
 
-@tree.command(name="setlog-ticket", description="Crea/configura el canal de registros de tickets", guild=GUILD)
+@tree.command(name="setlog-tickets", description="Crea/configura los registros de tickets", guild=GUILD)
 @app_commands.default_permissions(manage_guild=True)
 async def set_ticket_log(interaction: discord.Interaction):
     guild = interaction.guild
@@ -447,19 +429,26 @@ async def set_ticket_log(interaction: discord.Interaction):
         return
     channel = discord.utils.get(guild.text_channels, name="ticket-logs")
     if channel is None:
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(view_channel=False),
-            interaction.user: discord.PermissionOverwrite(view_channel=True, read_message_history=True),
-            bot_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, embed_links=True),
-        }
+        overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=False), interaction.user: discord.PermissionOverwrite(view_channel=True, read_message_history=True), bot_member: discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, embed_links=True)}
         try:
-            channel = await guild.create_text_channel("ticket-logs", overwrites=overwrites, reason=f"Registro de tickets configurado por {interaction.user}")
+            channel = await guild.create_text_channel("ticket-logs", overwrites=overwrites, reason=f"Logs configurados por {interaction.user}")
         except (discord.Forbidden, discord.HTTPException) as error:
             await interaction.response.send_message(f"No pude crear ticket-logs: {error}", ephemeral=True)
             return
     config["ticket_log"][str(guild.id)] = channel.id
     save_config()
     await interaction.response.send_message(f"✅ Registros de tickets en {channel.mention}.", ephemeral=True)
+
+
+@tree.command(name="unsetlog-tickets", description="Desactiva los registros de tickets", guild=GUILD)
+@app_commands.default_permissions(manage_guild=True)
+async def unset_ticket_log(interaction: discord.Interaction):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("Necesitas Administrar servidor.", ephemeral=True)
+        return
+    config["ticket_log"].pop(str(interaction.guild.id), None)
+    save_config()
+    await interaction.response.send_message("✅ Registro de tickets desactivado; no borraré el canal.", ephemeral=True)
 
 
 @tree.command(name="setlog", description="Crea/configura el canal de auditoría", guild=GUILD)
@@ -486,7 +475,57 @@ async def setlog(interaction: discord.Interaction):
     await interaction.response.send_message(f"✅ Auditoría configurada en {channel.mention}.", ephemeral=True)
 
 
-@tree.command(name="juego-placeholder", description="Este comando no se utiliza", guild=GUILD)
+@tree.command(name="unsetlog", description="Desactiva los registros de auditoría", guild=GUILD)
+@app_commands.default_permissions(manage_guild=True)
+async def unsetlog(interaction: discord.Interaction):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message("Necesitas Administrar servidor.", ephemeral=True)
+        return
+    config["audit_log"].pop(str(interaction.guild.id), None)
+    save_config()
+    await interaction.response.send_message("✅ Registro de auditoría desactivado; no borraré el canal.", ephemeral=True)
+
+
+@tree.command(name="antispam", description="Activa o desactiva la protección contra spam", guild=GUILD)
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.choices(accion=[app_commands.Choice(name="activar", value="activar"), app_commands.Choice(name="desactivar", value="desactivar")])
+@app_commands.choices(repeticiones=[app_commands.Choice(name="3 repeticiones", value=3), app_commands.Choice(name="5 repeticiones", value=5)])
+@app_commands.describe(accion="Activar o desactivar antispam", repeticiones="Umbral de mensajes repetidos en 8 segundos")
+async def antispam(interaction: discord.Interaction, accion: app_commands.Choice[str], repeticiones: app_commands.Choice[int]):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not (interaction.user.guild_permissions.manage_guild or is_admin_or_owner(interaction.user)):
+        await interaction.response.send_message("Solo administradores pueden configurar antispam.", ephemeral=True)
+        return
+    key = str(interaction.guild.id)
+    if accion.value == "activar":
+        config["antispam"][key] = int(repeticiones.value)
+        text = f"✅ Antispam activado: se borrarán mensajes repetidos al llegar a {repeticiones.value} en 8 segundos."
+    else:
+        config["antispam"].pop(key, None)
+        text = "✅ Antispam desactivado."
+    save_config()
+    await interaction.response.send_message(text, ephemeral=True)
+
+
+@tree.command(name="antilink", description="Activa o desactiva el filtro de enlaces", guild=GUILD)
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.choices(accion=[app_commands.Choice(name="activar", value="activar"), app_commands.Choice(name="desactivar", value="desactivar")])
+@app_commands.describe(accion="Activar o desactivar el filtro de enlaces")
+async def antilink(interaction: discord.Interaction, accion: app_commands.Choice[str]):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member) or not (interaction.user.guild_permissions.manage_guild or is_admin_or_owner(interaction.user)):
+        await interaction.response.send_message("Solo administradores pueden configurar antilink.", ephemeral=True)
+        return
+    key = str(interaction.guild.id)
+    if accion.value == "activar":
+        config["antilink"][key] = True
+        text = "✅ Antilink activado. Se eliminarán URLs y enlaces de invitación publicados por miembros no administradores."
+    else:
+        config["antilink"].pop(key, None)
+        text = "✅ Antilink desactivado."
+    save_config()
+    await interaction.response.send_message(text, ephemeral=True)
+
+
+@tree.command(name="juego-placeholder", description="Usa /juego button", guild=GUILD)
 async def juego_placeholder(interaction):
     await interaction.response.send_message("Usa `/juego button`.", ephemeral=True)
 
@@ -793,9 +832,38 @@ async def on_message(message):
                 pass
         await message.channel.send(embed=await avatar_embed(target))
         return
-    if isinstance(message.author, discord.Member) and not message.author.guild_permissions.administrator:
+    member = message.author if isinstance(message.author, discord.Member) else None
+    if member and not is_admin_or_owner(member):
+        guild_key = str(message.guild.id)
+        # Antispam: remove a burst of repeated messages inside an 8-second window.
+        threshold = config["antispam"].get(guild_key)
+        if threshold:
+            now = time.monotonic()
+            key = (message.guild.id, message.author.id, message.channel.id)
+            record = spam_records.setdefault(key, {"last": None, "times": []})
+            record["times"] = [stamp for stamp in record["times"] if now - stamp <= 8]
+            repeated = bool(record["last"] and normalize(content) == record["last"])
+            record["times"].append(now)
+            record["last"] = normalize(content)
+            if len(record["times"]) >= int(threshold) and repeated:
+                try:
+                    await message.channel.purge(limit=min(len(record["times"]), 10), check=lambda item: item.author.id == message.author.id and normalize(item.content) == normalize(content))
+                except (discord.Forbidden, discord.HTTPException):
+                    try:
+                        await message.delete()
+                    except (discord.Forbidden, discord.HTTPException):
+                        pass
+                spam_records.pop(key, None)
+                return
+        # Antilink removes URLs and Discord invite links from non-admin members.
+        if config["antilink"].get(guild_key) and re.search(r"(?:https?://|www\.)\S+|discord(?:\.gg|\.com/invite)/\S+", content, re.IGNORECASE):
+            try:
+                await message.delete()
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+            return
         normalized = normalize(content)
-        for word in config["blocked_words"].get(str(message.guild.id), []):
+        for word in config["blocked_words"].get(guild_key, []):
             if re.search(rf"(?<!\w){re.escape(word)}(?!\w)", normalized):
                 try:
                     await message.delete()
