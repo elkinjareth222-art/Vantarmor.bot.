@@ -6,7 +6,7 @@ from discord import app_commands
 
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("DISCORD_GUILD_ID")
+GUILD_ID = os.getenv("1559455132821753856")
 
 if not TOKEN:
     raise RuntimeError("Falta la variable DISCORD_TOKEN en Railway.")
