@@ -39,9 +39,12 @@ def normalize(text: str) -> str:
 
 
 def duration_seconds(text: str) -> Optional[int]:
-    """Accepts 1m, 1h, 1d, 1mon and 1year (also Spanish unit names)."""
+    """Accept 1m, 1h, 1d, 1mon, 1year, and Spanish equivalents."""
     value = normalize(text.strip())
-    match = re.fullmatch(r"(\d+)\s*(m|min|mins|minuto|minutos|h|hr|hrs|hora|horas|d|dia|dias|mon|month|mes|meses|year|yr|ano|anos)", value)
+    match = re.fullmatch(
+        r"(\d+)\s*(m|min|mins|minuto|minutos|h|hr|hrs|hora|horas|d|dia|dias|mon|month|mes|meses|year|yr|ano|anos)",
+        value,
+    )
     if not match or int(match.group(1)) < 1:
         return None
     count, unit = int(match.group(1)), match.group(2)
@@ -68,24 +71,18 @@ def duration_label(seconds: int) -> str:
     return f"{seconds // 60} minuto(s)"
 
 
-def format_elapsed(seconds: float) -> str:
+def elapsed_label(seconds: float) -> str:
     seconds = max(0, int(seconds))
-    units = [("día", 86400), ("hora", 3600), ("minuto", 60), ("segundo", 1)]
     parts = []
-    for name, amount in units:
+    for name, amount in (("día", 86400), ("hora", 3600), ("minuto", 60), ("segundo", 1)):
         value, seconds = divmod(seconds, amount)
         if value:
             parts.append(f"{value} {name if value == 1 else name + 's'}")
     return ", ".join(parts) or "0 segundos"
 
 
-async def activate_afk(guild_id, user, reason):
-    afk_users[(guild_id, user.id)] = {"started": time.time(), "reason": reason or "Sin motivo"}
-
-
 async def audit(guild, title, description, color=discord.Color.orange()):
-    channel_id = audit_channels.get(guild.id)
-    channel = guild.get_channel(channel_id) if channel_id else None
+    channel = guild.get_channel(audit_channels.get(guild.id, 0))
     if channel is None:
         channel = discord.utils.get(guild.text_channels, name="auditoria-logs")
         if channel:
@@ -102,12 +99,38 @@ async def audit(guild, title, description, color=discord.Color.orange()):
 async def audit_executor(guild, action, target_id):
     try:
         async for entry in guild.audit_logs(limit=20, action=action):
-            if getattr(entry.target, "id", None) == target_id:
-                if (datetime.now(timezone.utc) - entry.created_at).total_seconds() <= 30:
-                    return entry.user, entry.reason
+            if getattr(entry.target, "id", None) == target_id and (datetime.now(timezone.utc) - entry.created_at).total_seconds() <= 30:
+                return entry.user, entry.reason
     except (discord.Forbidden, discord.HTTPException):
         pass
     return None, None
+
+
+async def timeout_member(guild, actor, target, seconds):
+    allowed_roles = {"aislamiento", "silenciador"}
+    if not isinstance(actor, discord.Member) or not any(normalize(role.name) in allowed_roles for role in actor.roles):
+        return "Solo miembros con el rol `Aislamiento` o `Silenciador` pueden usar este comando."
+    if seconds is None or seconds < 60:
+        return "Duración no válida. Usa `12m`, `1h`, `1d`, `1mon` o `1year` (mínimo 1m)."
+    if seconds > 28 * 86400:
+        return "Discord limita el aislamiento a 28 días. Usa una duración de `28d` o menos."
+    if target.bot or target.id in (guild.owner_id, actor.id):
+        return "No puedes aislar a bots, al propietario ni a ti mismo."
+    if actor.id != guild.owner_id and target.top_role >= actor.top_role:
+        return "No puedes aislar a alguien con un rol igual o superior al tuyo."
+    bot_member = guild.me
+    if bot_member is None or not bot_member.guild_permissions.moderate_members:
+        return "Al bot le falta el permiso Moderar miembros."
+    if target.top_role >= bot_member.top_role:
+        return "El rol del miembro está por encima o al mismo nivel que el rol del bot."
+    try:
+        until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+        await target.timeout(until, reason=f"Aislamiento aplicado por {actor}")
+        return f"🔇 {target.mention} quedó aislado durante **{duration_label(seconds)}**."
+    except discord.Forbidden:
+        return "Discord rechazó el aislamiento. Revisa Moderar miembros y la jerarquía de roles."
+    except discord.HTTPException:
+        return "No pude aplicar el aislamiento por un error de Discord."
 
 
 async def moderate_member(guild, actor, target, action):
@@ -129,38 +152,8 @@ async def moderate_member(guild, actor, target, action):
             return f"🔨 {target.mention} fue baneado."
         await guild.kick(target, reason=f"Acción solicitada por {actor}")
         return f"👢 {target.mention} fue expulsado."
-    except discord.Forbidden:
-        return "Discord rechazó la acción. Revisa permisos y jerarquía de roles."
-    except discord.HTTPException:
-        return "No pude completar la acción por un error de Discord."
-
-
-async def timeout_member(guild, actor, target, seconds, reason=None):
-    if not isinstance(actor, discord.Member) or not any(normalize(role.name) in ("aislamiento", "silenciador") for role in actor.roles):
-        return "Solo los miembros con el rol `Aislamiento` o `Silenciador` pueden usar este comando."
-    if seconds is None or seconds < 60:
-        return "Duración no válida. Usa, por ejemplo, `12m`, `1h` o `1d` (mínimo 1 minuto)."
-    # Discord limita los timeouts a 28 días; meses y años se aceptan como formato,
-    # pero se rechazan si exceden el límite de la plataforma.
-    if seconds > 28 * 86400:
-        return "Discord limita los aislamientos a 28 días. Elige una duración menor o igual a `28d`."
-    if target.bot or target.id == guild.owner_id or target.id == actor.id:
-        return "No puedes aislar a bots, al propietario ni a ti mismo."
-    if actor.id != guild.owner_id and target.top_role >= actor.top_role:
-        return "No puedes aislar a alguien con un rol igual o superior al tuyo."
-    bot_member = guild.me
-    if bot_member is None or not bot_member.guild_permissions.moderate_members:
-        return "Al bot le falta el permiso Moderar miembros."
-    if target.top_role >= bot_member.top_role:
-        return "El rol del miembro está por encima o al mismo nivel que el rol del bot."
-    try:
-        until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
-        await target.timeout(until, reason=reason or f"Aislamiento aplicado por {actor}")
-        return f"🔇 {target.mention} quedó aislado durante **{duration_label(seconds)}**."
-    except discord.Forbidden:
-        return "Discord rechazó el aislamiento. Revisa Moderar miembros y la jerarquía de roles."
-    except discord.HTTPException:
-        return "No pude aplicar el aislamiento por un error de Discord."
+    except (discord.Forbidden, discord.HTTPException) as error:
+        return f"No pude completar la acción: {error}"
 
 
 async def change_channel_lock(channel, actor, lock):
@@ -209,7 +202,7 @@ def server_info_embed(guild):
     embed.add_field(name="Servidor", value=f"ID: `{guild.id}`\nPropietario: <@{guild.owner_id}>\nCreado: <t:{int(guild.created_at.timestamp())}:F>", inline=False)
     embed.add_field(name="Miembros", value=f"Total: **{guild.member_count or 0}**\nBots en caché: **{sum(member.bot for member in guild.members)}**", inline=True)
     embed.add_field(name="Canales", value=f"Texto: **{text_count}**\nVoz/escenario: **{voice_count}**\nForos: **{forum_count}**\nCategorías: **{category_count}**", inline=True)
-    embed.add_field(name="Roles y recursos", value=f"Roles: **{len(guild.roles)}**\nEmojis: **{len(guild.emojis)}**\nStickers: **{len(guild.stickers)}", inline=True)
+    embed.add_field(name="Roles y recursos", value=f"Roles: **{len(guild.roles)}**\nEmojis: **{len(guild.emojis)}**\nStickers: **{len(guild.stickers)}**", inline=True)
     embed.add_field(name="Boosts", value=f"Nivel: **{guild.premium_tier}**\nBoosts: **{guild.premium_subscription_count or 0}**", inline=True)
     embed.add_field(name="Seguridad", value=f"Verificación: **{guild.verification_level}**\nFiltro de contenido: **{guild.explicit_content_filter}**\nMFA moderadores: **{'Sí' if guild.mfa_level else 'No'}**", inline=True)
     embed.add_field(name="Otros", value=f"Idioma: **{guild.preferred_locale}**\nDescripción: **{guild.description or 'Sin descripción'}**", inline=False)
@@ -235,17 +228,12 @@ async def ping(interaction):
     await interaction.response.send_message("¡Pong! ✅")
 
 
-@tree.command(name="hola", description="Saluda al usuario", guild=GUILD)
-async def hola(interaction):
-    await interaction.response.send_message(f"¡Hola, {interaction.user.mention}! 👋", allowed_mentions=discord.AllowedMentions.none())
-
-
-@tree.command(name="ayuda", description="Muestra los comandos disponibles", guild=GUILD)
+@tree.command(name="ayuda", description="Muestra comandos disponibles", guild=GUILD)
 async def ayuda(interaction):
-    await interaction.response.send_message("`/serverinfo`, `/infoserver`, `/userinfo usuario`, `/setlog`, `/juego button`, `/time out usuario duración`, `/timeout`, `/lock`, `/unlock`, `/bloqueo_palabra`, `/desbloqueo_palabra`, `/purge`, `/afk`, `/avatar`, `/sorteo`, `/cookie`, `/número`, `/autorole`, `/ban`, `/kick`, `/invite` y `/anuncio`. Prefijos: `?servidor`, responde con `?info`, `?time out 12m`, `?lock`, `?unlock` y `?purge 16`.", ephemeral=True)
+    await interaction.response.send_message("`/serverinfo`, `/infoserver`, `/userinfo`, `/setlog`, `/juego button`, `/time out`, `/timeout`, `/lock`, `/unlock`, `/purge`, `/afk`, `/avatar`, `/sorteo`, `/cookie`, `/número`, `/autorole`, `/ban`, `/kick`, `/invite`, `/anuncio`. Texto: `?servidor`, responde con `?info`, `?time out 12m`, `?lock`, `?unlock`, `?purge 16`.", ephemeral=True)
 
 
-@tree.command(name="serverinfo", description="Muestra información detallada del servidor", guild=GUILD)
+@tree.command(name="serverinfo", description="Muestra información del servidor", guild=GUILD)
 async def serverinfo(interaction):
     if interaction.guild is None:
         await interaction.response.send_message("Úsalo dentro de un servidor.", ephemeral=True)
@@ -272,7 +260,7 @@ async def userinfo(interaction, usuario: discord.Member):
 async def setlog(interaction):
     guild = interaction.guild
     if guild is None or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_guild:
-        await interaction.response.send_message("Necesitas Administrar servidor y usarlo dentro de un servidor.", ephemeral=True)
+        await interaction.response.send_message("Necesitas Administrar servidor.", ephemeral=True)
         return
     bot_member = guild.me
     if bot_member is None or not bot_member.guild_permissions.manage_channels:
@@ -288,7 +276,7 @@ async def setlog(interaction):
         try:
             channel = await guild.create_text_channel("auditoria-logs", overwrites=overwrites, reason=f"Auditoría configurada por {interaction.user}")
         except (discord.Forbidden, discord.HTTPException) as error:
-            await interaction.response.send_message(f"No pude crear el canal de auditoría: {error}", ephemeral=True)
+            await interaction.response.send_message(f"No pude crear el canal: {error}", ephemeral=True)
             return
     audit_channels[guild.id] = channel.id
     await interaction.response.send_message(f"✅ Auditoría configurada en {channel.mention}.", ephemeral=True)
@@ -297,287 +285,18 @@ async def setlog(interaction):
 
 @tree.command(name="afk", description="Activa tu estado AFK", guild=GUILD)
 @app_commands.describe(motivo="Motivo opcional")
-async def afk_slash(interaction, motivo: Optional[str] = None):
+async def afk_command(interaction, motivo: Optional[str] = None):
     if interaction.guild_id is None:
         await interaction.response.send_message("Úsalo dentro de un servidor.", ephemeral=True)
         return
-    reason = motivo.strip() if motivo and motivo.strip() else "Sin motivo"
-    await activate_afk(interaction.guild_id, interaction.user, reason)
-    await interaction.response.send_message(f"{interaction.user.mention} está AFK. Motivo: {reason}", allowed_mentions=discord.AllowedMentions.none())
+    afk_users[(interaction.guild_id, interaction.user.id)] = {"started": time.time(), "reason": motivo or "Sin motivo"}
+    await interaction.response.send_message(f"{interaction.user.mention} está AFK. Motivo: {motivo or 'Sin motivo'}", allowed_mentions=discord.AllowedMentions.none())
 
 
 @tree.command(name="avatar", description="Muestra avatar y banner de un miembro", guild=GUILD)
-@app_commands.describe(usuario="Miembro cuyo avatar y banner quieres ver")
-async def avatar_slash(interaction, usuario: discord.Member):
+@app_commands.describe(usuario="Miembro cuyo avatar quieres ver")
+async def avatar_command(interaction, usuario: discord.Member):
     await interaction.response.send_message(embed=await avatar_embed(usuario))
-
-
-@tree.command(name="sorteo", description="Crea un sorteo en este canal", guild=GUILD)
-@app_commands.describe(ganadores="Cantidad de ganadores (1 a 10)", duracion="Ejemplo: 10m, 2h, 3d", premio="Premio opcional")
-async def sorteo(interaction, ganadores: app_commands.Range[int, 1, 10], duracion: str, premio: Optional[str] = None):
-    seconds = duration_seconds(duracion)
-    if seconds is None:
-        await interaction.response.send_message("Duración no válida. Ejemplos: `10m`, `2h`, `3d`.", ephemeral=True)
-        return
-    view = SorteoView(premio.strip() if premio and premio.strip() else "Premio sorpresa", ganadores, seconds, interaction.channel)
-    await interaction.response.send_message(embed=view.embed(), view=view)
-    view.message = await interaction.original_response()
-    asyncio.create_task(view.finish())
-
-
-class SorteoView(discord.ui.View):
-    def __init__(self, prize, winners, seconds, channel):
-        super().__init__(timeout=None)
-        self.prize, self.winners, self.seconds, self.channel = prize, winners, seconds, channel
-        self.entries, self.message, self.finished = set(), None, False
-        self.lock = asyncio.Lock()
-
-    def embed(self, finished=False, winners=None):
-        embed = discord.Embed(title="🎉 Sorteo", description=f"**Premio:** {self.prize}", color=discord.Color.blurple())
-        embed.add_field(name="Ganadores", value=str(self.winners), inline=True)
-        embed.add_field(name="Participantes", value=str(len(self.entries)), inline=True)
-        embed.add_field(name="Resultado" if finished else "Participa", value=(" ".join(f"<@{u}>" for u in winners) if winners else "Sin participantes") if finished else "Pulsa 🎁 Participar para entrar/salir.", inline=False)
-        return embed
-
-    @discord.ui.button(label="🎁 Participar", style=discord.ButtonStyle.primary, custom_id="sorteo:participar")
-    async def enter(self, interaction, button):
-        async with self.lock:
-            if self.finished:
-                await interaction.response.send_message("Este sorteo ya terminó.", ephemeral=True)
-                return
-            if interaction.user.id in self.entries:
-                self.entries.remove(interaction.user.id)
-                text = "Saliste del sorteo."
-            else:
-                self.entries.add(interaction.user.id)
-                text = "¡Ya estás participando!"
-            await interaction.response.send_message(text, ephemeral=True)
-            if self.message:
-                await self.message.edit(embed=self.embed(), view=self)
-
-    async def finish(self):
-        await asyncio.sleep(self.seconds)
-        async with self.lock:
-            self.finished = True
-            winners = random.sample(list(self.entries), min(self.winners, len(self.entries))) if self.entries else []
-            for item in self.children:
-                item.disabled = True
-            if self.message:
-                await self.message.edit(embed=self.embed(True, winners), view=self)
-            if winners:
-                await self.channel.send("🎉 Ganador(es): " + " ".join(f"<@{u}>" for u in winners), allowed_mentions=discord.AllowedMentions(users=True))
-
-
-class CookieView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=60)
-        self.finished = False
-        self.message = None
-        self.lock = asyncio.Lock()
-
-    @discord.ui.button(label="🍪", style=discord.ButtonStyle.success, custom_id="cookie_game:click")
-    async def click(self, interaction, button):
-        async with self.lock:
-            if self.finished:
-                await interaction.response.send_message("Alguien ya ganó.", ephemeral=True)
-                return
-            self.finished = True
-            button.disabled = True
-            await interaction.response.edit_message(content=f"🍪 {interaction.user.mention} tocó la galleta primero y ganó.", view=self, allowed_mentions=discord.AllowedMentions.none())
-
-    async def on_timeout(self):
-        if not self.finished and self.message:
-            self.finished = True
-            for item in self.children:
-                item.disabled = True
-            await self.message.edit(content="⏰ Nadie tocó la galleta.", view=self)
-
-
-@tree.command(name="cookie", description="Juego de la galleta", guild=GUILD)
-async def cookie_game(interaction):
-    await interaction.response.send_message("La galleta aparece en **5**…")
-    message = await interaction.original_response()
-    for number in range(4, 0, -1):
-        await asyncio.sleep(1)
-        await message.edit(content=f"La galleta aparece en **{number}**…")
-    await asyncio.sleep(1)
-    view = CookieView()
-    view.message = message
-    await message.edit(content="🍪 ¡Tócala primero!", view=view)
-
-
-@tree.command(name="número", description="Elige un número secreto del 1 al 200", guild=GUILD)
-@app_commands.describe(numero="Número secreto, entre 1 y 200")
-async def number_game(interaction, numero: app_commands.Range[int, 1, 200]):
-    if interaction.guild_id is None or interaction.channel is None:
-        await interaction.response.send_message("Úsalo dentro de un servidor.", ephemeral=True)
-        return
-    async with number_game_lock:
-        if interaction.guild_id in active_number_games:
-            await interaction.response.send_message("Ya hay una partida activa.", ephemeral=True)
-            return
-        active_number_games[interaction.guild_id] = {"number": numero, "author": interaction.user.id}
-    await interaction.response.send_message("Partida iniciada; el número es secreto.", ephemeral=True)
-    await interaction.channel.send(f"🎲 {interaction.user.mention} piensa en un número del 1 al 200. ¡Adivínenlo!", allowed_mentions=discord.AllowedMentions.none())
-
-
-@tree.command(name="autorole", description="Configura el rol de nuevos miembros", guild=GUILD)
-@app_commands.default_permissions(manage_roles=True)
-@app_commands.describe(rol="Rol que recibirán los nuevos miembros")
-async def autorole(interaction, rol: discord.Role):
-    guild = interaction.guild
-    if guild is None or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_roles:
-        await interaction.response.send_message("Necesitas Administrar roles.", ephemeral=True)
-        return
-    bot_member = guild.me
-    if bot_member is None or not bot_member.guild_permissions.manage_roles or rol.is_default() or rol.managed or rol >= bot_member.top_role:
-        await interaction.response.send_message("No puedo asignar ese rol; revisa permisos y jerarquía.", ephemeral=True)
-        return
-    if interaction.user.id != guild.owner_id and rol >= interaction.user.top_role:
-        await interaction.response.send_message("El rol debe estar por debajo del tuyo.", ephemeral=True)
-        return
-    autoroles[guild.id] = rol.id
-    await interaction.response.send_message(f"✅ Autorole configurado: {rol.mention}.", allowed_mentions=discord.AllowedMentions.none())
-
-
-@tree.command(name="ban", description="Banea a un miembro", guild=GUILD)
-@app_commands.default_permissions(ban_members=True)
-@app_commands.describe(usuario="Miembro que quieres banear")
-async def ban_command(interaction, usuario: discord.Member):
-    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("Úsalo dentro de un servidor.", ephemeral=True)
-        return
-    result = await moderate_member(interaction.guild, interaction.user, usuario, "ban")
-    await interaction.response.send_message(result, allowed_mentions=discord.AllowedMentions.none())
-
-
-@tree.command(name="kick", description="Expulsa a un miembro", guild=GUILD)
-@app_commands.default_permissions(kick_members=True)
-@app_commands.describe(usuario="Miembro que quieres expulsar")
-async def kick_command(interaction, usuario: discord.Member):
-    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("Úsalo dentro de un servidor.", ephemeral=True)
-        return
-    result = await moderate_member(interaction.guild, interaction.user, usuario, "kick")
-    await interaction.response.send_message(result, allowed_mentions=discord.AllowedMentions.none())
-
-
-async def run_timeout(interaction, usuario, duracion):
-    seconds = duration_seconds(duracion)
-    result = await timeout_member(interaction.guild, interaction.user, usuario, seconds)
-    await interaction.response.send_message(result, allowed_mentions=discord.AllowedMentions.none())
-    if seconds and seconds <= 28 * 86400 and "quedó aislado" in result:
-        await audit(interaction.guild, "Miembro aislado", f"**Miembro:** {usuario.mention}\n**Moderador:** {interaction.user.mention}\n**Duración:** {duracion}", discord.Color.red())
-
-
-time_group = app_commands.Group(name="time", description="Comandos de aislamiento", guild=GUILD)
-
-
-@time_group.command(name="out", description="Aísla temporalmente a un miembro")
-@app_commands.describe(usuario="Miembro que se aislará", duracion="Duración: 1m, 1h, 1d, 1mon o 1year (máximo 28d)")
-async def time_out_command(interaction, usuario: discord.Member, duracion: str):
-    await run_timeout(interaction, usuario, duracion)
-
-
-tree.add_command(time_group)
-
-
-@tree.command(name="timeout", description="Aísla temporalmente a un miembro", guild=GUILD)
-@app_commands.describe(usuario="Miembro que se aislará", duracion="Duración: 1m, 1h o 1d; máximo 28d")
-async def timeout_command(interaction, usuario: discord.Member, duracion: str):
-    await run_timeout(interaction, usuario, duracion)
-
-
-@tree.command(name="invite", description="Muestra las invitaciones atribuidas a un miembro", guild=GUILD)
-@app_commands.describe(usuario="Miembro opcional")
-async def invite_command(interaction, usuario: Optional[discord.Member] = None):
-    if interaction.guild_id is None:
-        await interaction.response.send_message("Úsalo dentro de un servidor.", ephemeral=True)
-        return
-    target = usuario or interaction.user
-    await interaction.response.send_message(f"📨 {target.mention} ha invitado a **{invite_counts.get((interaction.guild_id, target.id), 0)}** persona(s) desde que el bot está activo.", allowed_mentions=discord.AllowedMentions.none())
-
-
-@tree.command(name="lock", description="Bloquea el canal actual", guild=GUILD)
-@app_commands.default_permissions(manage_channels=True)
-async def lock_command(interaction):
-    if interaction.guild and interaction.channel and isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message(await change_channel_lock(interaction.channel, interaction.user, True))
-    else:
-        await interaction.response.send_message("Úsalo dentro de un canal del servidor.", ephemeral=True)
-
-
-@tree.command(name="unlock", description="Desbloquea el canal actual", guild=GUILD)
-@app_commands.default_permissions(manage_channels=True)
-async def unlock_command(interaction):
-    if interaction.guild and interaction.channel and isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message(await change_channel_lock(interaction.channel, interaction.user, False))
-    else:
-        await interaction.response.send_message("Úsalo dentro de un canal del servidor.", ephemeral=True)
-
-
-@tree.command(name="bloqueo_palabra", description="Añade una palabra al filtro", guild=GUILD)
-@app_commands.default_permissions(manage_messages=True)
-@app_commands.describe(palabra="Palabra o frase que se eliminará")
-async def block_word(interaction, palabra: str):
-    if interaction.guild_id is None or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_messages:
-        await interaction.response.send_message("Necesitas Administrar mensajes.", ephemeral=True)
-        return
-    key = normalize(palabra.strip())
-    if not key or len(palabra) > 100:
-        await interaction.response.send_message("Escribe una palabra o frase de hasta 100 caracteres.", ephemeral=True)
-        return
-    words = blocked_words.setdefault(interaction.guild_id, set())
-    if key in words:
-        await interaction.response.send_message("Esa palabra ya está bloqueada.", ephemeral=True)
-        return
-    words.add(key)
-    await interaction.response.send_message(f"✅ Se añadió `{palabra}` al filtro.", ephemeral=True)
-
-
-@tree.command(name="desbloqueo_palabra", description="Quita una palabra del filtro", guild=GUILD)
-@app_commands.default_permissions(manage_messages=True)
-@app_commands.describe(palabra="Palabra o frase que desbloquearás")
-async def unblock_word(interaction, palabra: str):
-    key = normalize(palabra.strip())
-    words = blocked_words.setdefault(interaction.guild_id or 0, set())
-    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_messages:
-        await interaction.response.send_message("Necesitas Administrar mensajes.", ephemeral=True)
-        return
-    if key not in words:
-        await interaction.response.send_message("Esa palabra no está bloqueada.", ephemeral=True)
-        return
-    words.remove(key)
-    await interaction.response.send_message(f"✅ Se quitó `{palabra}` del filtro.", ephemeral=True)
-
-
-@tree.command(name="purge", description="Elimina de 1 a 100 mensajes", guild=GUILD)
-@app_commands.default_permissions(manage_messages=True)
-@app_commands.describe(cantidad="Cantidad de mensajes, entre 1 y 100")
-async def purge_command(interaction, cantidad: app_commands.Range[int, 1, 100]):
-    if interaction.guild is None or interaction.channel is None or not isinstance(interaction.user, discord.Member):
-        await interaction.response.send_message("Úsalo dentro de un canal del servidor.", ephemeral=True)
-        return
-    if not interaction.user.guild_permissions.manage_messages or not interaction.guild.me.guild_permissions.manage_messages:
-        await interaction.response.send_message("Tú y el bot necesitan Administrar mensajes.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    try:
-        deleted = len(await interaction.channel.purge(limit=cantidad, bulk=False))
-        await interaction.followup.send(f"🧹 Eliminé {deleted} mensaje(s).", ephemeral=True)
-    except (discord.Forbidden, discord.HTTPException) as error:
-        await interaction.followup.send(f"No pude eliminar los mensajes: {error}", ephemeral=True)
-
-
-@tree.command(name="anuncio", description="Envía un anuncio importante", guild=GUILD)
-@app_commands.default_permissions(manage_messages=True)
-@app_commands.describe(mensaje="Texto del anuncio")
-async def announcement(interaction, mensaje: str):
-    text = f"📢 **ANUNCIO IMPORTANTE**\n{mensaje.strip()}"
-    if not mensaje.strip() or len(text) > 2000:
-        await interaction.response.send_message("Escribe un anuncio de hasta 2000 caracteres.", ephemeral=True)
-        return
-    await interaction.response.send_message(text, allowed_mentions=discord.AllowedMentions.none())
 
 
 class LuckView(discord.ui.View):
@@ -613,16 +332,246 @@ async def juego_button(interaction, mensaje: str):
 tree.add_command(juego_group, guild=GUILD)
 
 
-@client.event
-async def on_interaction(interaction):
-    if interaction.type != discord.InteractionType.application_command or interaction.guild is None:
+class GiveawayView(discord.ui.View):
+    def __init__(self, prize, winner_count, seconds, channel):
+        super().__init__(timeout=None)
+        self.prize, self.winner_count, self.seconds, self.channel = prize, winner_count, seconds, channel
+        self.entries, self.message, self.finished = set(), None, False
+        self.lock = asyncio.Lock()
+
+    def make_embed(self, finished=False, winners=None):
+        embed = discord.Embed(title="🎉 Sorteo", description=f"**Premio:** {self.prize}", color=discord.Color.blurple())
+        embed.add_field(name="Ganadores", value=str(self.winner_count), inline=True)
+        embed.add_field(name="Participantes", value=str(len(self.entries)), inline=True)
+        embed.add_field(name="Resultado" if finished else "Participa", value=(" ".join(f"<@{u}>" for u in winners) if winners else "Sin participantes") if finished else "Pulsa 🎁 Participar para entrar o salir.", inline=False)
+        return embed
+
+    @discord.ui.button(label="🎁 Participar", style=discord.ButtonStyle.primary, custom_id="sorteo:participar")
+    async def enter(self, interaction, button):
+        async with self.lock:
+            if self.finished:
+                await interaction.response.send_message("Este sorteo ya terminó.", ephemeral=True)
+                return
+            if interaction.user.id in self.entries:
+                self.entries.remove(interaction.user.id)
+                answer = "Saliste del sorteo."
+            else:
+                self.entries.add(interaction.user.id)
+                answer = "¡Ya estás participando!"
+            await interaction.response.send_message(answer, ephemeral=True)
+            if self.message:
+                await self.message.edit(embed=self.make_embed(), view=self)
+
+    async def finish(self):
+        await asyncio.sleep(self.seconds)
+        async with self.lock:
+            self.finished = True
+            winners = random.sample(list(self.entries), min(self.winner_count, len(self.entries))) if self.entries else []
+            for item in self.children:
+                item.disabled = True
+            if self.message:
+                await self.message.edit(embed=self.make_embed(True, winners), view=self)
+            if winners:
+                await self.channel.send("🎉 Ganador(es): " + " ".join(f"<@{u}>" for u in winners), allowed_mentions=discord.AllowedMentions(users=True))
+
+
+@tree.command(name="sorteo", description="Crea un sorteo en este canal", guild=GUILD)
+@app_commands.describe(ganadores="Cantidad de ganadores (1 a 10)", duracion="Ejemplo 10m, 2h, 3d", premio="Premio opcional")
+async def sorteo(interaction, ganadores: app_commands.Range[int, 1, 10], duracion: str, premio: Optional[str] = None):
+    seconds = duration_seconds(duracion)
+    if seconds is None or interaction.channel is None:
+        await interaction.response.send_message("Duración inválida o canal no disponible. Usa `10m`, `2h`, `3d`.", ephemeral=True)
         return
-    data = interaction.data or {}
-    options = data.get("options", [])
-    summary = f"**Usuario:** {interaction.user.mention} (`{interaction.user.id}`)\n**Comando:** `/{data.get('name', 'comando')}`\n**Canal:** {interaction.channel.mention if interaction.channel else 'desconocido'}"
-    if options:
-        summary += "\n**Opciones:** " + ", ".join(f"{item.get('name')}: {str(item.get('value', item.get('options', '')))[:160]}" for item in options)
-    await audit(interaction.guild, "Comando slash usado", summary, discord.Color.blue())
+    view = GiveawayView(premio.strip() if premio and premio.strip() else "Premio sorpresa", ganadores, seconds, interaction.channel)
+    await interaction.response.send_message(embed=view.make_embed(), view=view)
+    view.message = await interaction.original_response()
+    asyncio.create_task(view.finish())
+
+
+@tree.command(name="cookie", description="Juego de tocar la galleta", guild=GUILD)
+async def cookie(interaction):
+    view = CookieView()
+    await interaction.response.send_message("🍪 ¡Toca la galleta primero!", view=view)
+
+
+class CookieView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+        self.finished = False
+        self.lock = asyncio.Lock()
+
+    @discord.ui.button(label="🍪", style=discord.ButtonStyle.success, custom_id="cookie_game:click")
+    async def click(self, interaction, button):
+        async with self.lock:
+            if self.finished:
+                await interaction.response.send_message("Alguien ya ganó.", ephemeral=True)
+                return
+            self.finished = True
+            button.disabled = True
+            await interaction.response.edit_message(content=f"🍪 {interaction.user.mention} tocó la galleta primero y ganó.", view=self, allowed_mentions=discord.AllowedMentions.none())
+
+
+@tree.command(name="número", description="Piensa un número para que los demás lo adivinen", guild=GUILD)
+@app_commands.describe(numero="Número secreto, entre 1 y 200")
+async def number_game(interaction, numero: app_commands.Range[int, 1, 200]):
+    if interaction.guild_id is None or interaction.channel is None:
+        await interaction.response.send_message("Úsalo dentro de un servidor.", ephemeral=True)
+        return
+    async with number_game_lock:
+        if interaction.guild_id in active_number_games:
+            await interaction.response.send_message("Ya hay una partida activa.", ephemeral=True)
+            return
+        active_number_games[interaction.guild_id] = {"number": numero, "author": interaction.user.id}
+    await interaction.response.send_message("Partida iniciada; el número es secreto.", ephemeral=True)
+    await interaction.channel.send(f"🎲 {interaction.user.mention} piensa en un número del 1 al 200. ¡Adivínenlo!", allowed_mentions=discord.AllowedMentions.none())
+
+
+@tree.command(name="autorole", description="Configura el rol de nuevos miembros", guild=GUILD)
+@app_commands.default_permissions(manage_roles=True)
+@app_commands.describe(rol="Rol que recibirán los nuevos miembros")
+async def autorole(interaction, rol: discord.Role):
+    guild = interaction.guild
+    if guild is None or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_roles:
+        await interaction.response.send_message("Necesitas Administrar roles.", ephemeral=True)
+        return
+    bot_member = guild.me
+    if bot_member is None or not bot_member.guild_permissions.manage_roles or rol.is_default() or rol.managed or rol >= bot_member.top_role:
+        await interaction.response.send_message("No puedo asignar ese rol; revisa permisos y jerarquía.", ephemeral=True)
+        return
+    autoroles[guild.id] = rol.id
+    await interaction.response.send_message(f"✅ Autorole configurado: {rol.mention}.", allowed_mentions=discord.AllowedMentions.none())
+
+
+@tree.command(name="ban", description="Banea a un miembro", guild=GUILD)
+@app_commands.default_permissions(ban_members=True)
+@app_commands.describe(usuario="Miembro que quieres banear")
+async def ban_command(interaction, usuario: discord.Member):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Úsalo dentro de un servidor.", ephemeral=True)
+        return
+    await interaction.response.send_message(await moderate_member(interaction.guild, interaction.user, usuario, "ban"), allowed_mentions=discord.AllowedMentions.none())
+
+
+@tree.command(name="kick", description="Expulsa a un miembro", guild=GUILD)
+@app_commands.default_permissions(kick_members=True)
+@app_commands.describe(usuario="Miembro que quieres expulsar")
+async def kick_command(interaction, usuario: discord.Member):
+    if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Úsalo dentro de un servidor.", ephemeral=True)
+        return
+    await interaction.response.send_message(await moderate_member(interaction.guild, interaction.user, usuario, "kick"), allowed_mentions=discord.AllowedMentions.none())
+
+
+async def apply_timeout_response(interaction, usuario, duracion):
+    seconds = duration_seconds(duracion)
+    result = await timeout_member(interaction.guild, interaction.user, usuario, seconds)
+    await interaction.response.send_message(result, allowed_mentions=discord.AllowedMentions.none())
+    if seconds and seconds <= 28 * 86400 and "quedó aislado" in result:
+        await audit(interaction.guild, "Miembro aislado", f"**Miembro:** {usuario.mention}\n**Moderador:** {interaction.user.mention}\n**Duración:** {duracion}", discord.Color.red())
+
+
+# Group constructor has no `guild` parameter in discord.py. Bind its guild on tree.add_command.
+time_group = app_commands.Group(name="time", description="Comandos de aislamiento")
+
+
+@time_group.command(name="out", description="Aísla temporalmente a un miembro")
+@app_commands.describe(usuario="Miembro que se aislará", duracion="Duración como 12m, 1h, 1d, 1mon o 1year (máx. 28d)")
+async def time_out_command(interaction, usuario: discord.Member, duracion: str):
+    await apply_timeout_response(interaction, usuario, duracion)
+
+
+tree.add_command(time_group, guild=GUILD)
+
+
+@tree.command(name="timeout", description="Aísla temporalmente a un miembro", guild=GUILD)
+@app_commands.describe(usuario="Miembro que se aislará", duracion="Duración como 12m, 1h o 1d (máx. 28d)")
+async def timeout_command(interaction, usuario: discord.Member, duracion: str):
+    await apply_timeout_response(interaction, usuario, duracion)
+
+
+@tree.command(name="invite", description="Muestra las invitaciones atribuidas a un miembro", guild=GUILD)
+@app_commands.describe(usuario="Miembro opcional")
+async def invite_command(interaction, usuario: Optional[discord.Member] = None):
+    target = usuario or interaction.user
+    await interaction.response.send_message(f"📨 {target.mention} ha invitado a **{invite_counts.get((interaction.guild_id, target.id), 0)}** persona(s) desde que el bot está activo.", allowed_mentions=discord.AllowedMentions.none())
+
+
+@tree.command(name="lock", description="Bloquea el canal actual", guild=GUILD)
+@app_commands.default_permissions(manage_channels=True)
+async def lock_command(interaction):
+    if interaction.guild and interaction.channel and isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(await change_channel_lock(interaction.channel, interaction.user, True))
+    else:
+        await interaction.response.send_message("Úsalo en un canal del servidor.", ephemeral=True)
+
+
+@tree.command(name="unlock", description="Desbloquea el canal actual", guild=GUILD)
+@app_commands.default_permissions(manage_channels=True)
+async def unlock_command(interaction):
+    if interaction.guild and interaction.channel and isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(await change_channel_lock(interaction.channel, interaction.user, False))
+    else:
+        await interaction.response.send_message("Úsalo en un canal del servidor.", ephemeral=True)
+
+
+@tree.command(name="bloqueo_palabra", description="Añade una palabra al filtro", guild=GUILD)
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(palabra="Palabra o frase que se eliminará")
+async def block_word(interaction, palabra: str):
+    if interaction.guild_id is None or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_messages:
+        await interaction.response.send_message("Necesitas Administrar mensajes.", ephemeral=True)
+        return
+    key = normalize(palabra.strip())
+    if not key or len(palabra) > 100:
+        await interaction.response.send_message("Escribe una palabra o frase de hasta 100 caracteres.", ephemeral=True)
+        return
+    blocked_words.setdefault(interaction.guild_id, set()).add(key)
+    await interaction.response.send_message(f"✅ Se añadió `{palabra}` al filtro.", ephemeral=True)
+
+
+@tree.command(name="desbloqueo_palabra", description="Quita una palabra del filtro", guild=GUILD)
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(palabra="Palabra o frase que desbloquearás")
+async def unblock_word(interaction, palabra: str):
+    if interaction.guild_id is None or not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.manage_messages:
+        await interaction.response.send_message("Necesitas Administrar mensajes.", ephemeral=True)
+        return
+    words = blocked_words.setdefault(interaction.guild_id, set())
+    key = normalize(palabra.strip())
+    if key not in words:
+        await interaction.response.send_message("Esa palabra no está bloqueada.", ephemeral=True)
+        return
+    words.remove(key)
+    await interaction.response.send_message(f"✅ Se quitó `{palabra}` del filtro.", ephemeral=True)
+
+
+@tree.command(name="purge", description="Elimina de 1 a 100 mensajes", guild=GUILD)
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(cantidad="Cantidad de mensajes, entre 1 y 100")
+async def purge_command(interaction, cantidad: app_commands.Range[int, 1, 100]):
+    if interaction.guild is None or interaction.channel is None or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Úsalo dentro de un canal del servidor.", ephemeral=True)
+        return
+    if not interaction.user.guild_permissions.manage_messages or not interaction.guild.me.guild_permissions.manage_messages:
+        await interaction.response.send_message("Tú y el bot necesitan Administrar mensajes.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        deleted = len(await interaction.channel.purge(limit=cantidad, bulk=False))
+        await interaction.followup.send(f"🧹 Eliminé {deleted} mensaje(s).", ephemeral=True)
+    except (discord.Forbidden, discord.HTTPException) as error:
+        await interaction.followup.send(f"No pude eliminar mensajes: {error}", ephemeral=True)
+
+
+@tree.command(name="anuncio", description="Envía un anuncio importante", guild=GUILD)
+@app_commands.default_permissions(manage_messages=True)
+@app_commands.describe(mensaje="Texto del anuncio")
+async def anuncio(interaction, mensaje: str):
+    text = f"📢 **ANUNCIO IMPORTANTE**\n{mensaje.strip()}"
+    if not mensaje.strip() or len(text) > 2000:
+        await interaction.response.send_message("Escribe un anuncio de hasta 2000 caracteres.", ephemeral=True)
+        return
+    await interaction.response.send_message(text, allowed_mentions=discord.AllowedMentions.none())
 
 
 @client.event
@@ -633,9 +582,6 @@ async def on_message(message):
     parts = content.split(maxsplit=2)
     command = parts[0].lower() if parts else ""
 
-    if content.startswith("?"):
-        await audit(message.guild, "Comando de texto usado", f"**Usuario:** {message.author.mention}\n**Comando:** `{content[:400]}`\n**Canal:** {message.channel.mention}", discord.Color.blue())
-
     if content.casefold() == "?servidor":
         await message.channel.send(embed=server_info_embed(message.guild))
         return
@@ -643,7 +589,7 @@ async def on_message(message):
     if content.casefold() == "?info":
         reference = message.reference
         if not reference or not reference.message_id:
-            await message.channel.send("Responde al mensaje de un miembro con `?info` para mostrar su información.")
+            await message.channel.send("Responde al mensaje de un miembro con `?info`.")
             return
         try:
             replied = reference.resolved
@@ -653,21 +599,21 @@ async def on_message(message):
             member = message.guild.get_member(replied.author.id) or await message.guild.fetch_member(replied.author.id)
             await message.channel.send(embed=user_info_embed(member))
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            await message.channel.send("No pude obtener la información del miembro mencionado en la respuesta.")
+            await message.channel.send("No pude encontrar al miembro respondido.")
         return
 
     if len(parts) == 3 and parts[0].casefold() == "?time" and parts[1].casefold() == "out":
         if not isinstance(message.author, discord.Member):
             return
-        ref = message.reference
-        if not ref or not ref.message_id:
-            await message.channel.send("Responde al mensaje del miembro que quieres aislar: `?time out 12m`.")
+        reference = message.reference
+        if not reference or not reference.message_id:
+            await message.channel.send("Responde al miembro que quieres aislar: `?time out 12m`.")
             return
         try:
-            replied = ref.resolved
+            replied = reference.resolved
             if replied is None:
-                channel = message.guild.get_channel(ref.channel_id) or await client.fetch_channel(ref.channel_id)
-                replied = await channel.fetch_message(ref.message_id)
+                channel = message.guild.get_channel(reference.channel_id) or await client.fetch_channel(reference.channel_id)
+                replied = await channel.fetch_message(reference.message_id)
             target = message.guild.get_member(replied.author.id) or await message.guild.fetch_member(replied.author.id)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             await message.channel.send("No pude encontrar al miembro respondido.")
@@ -696,7 +642,7 @@ async def on_message(message):
             deleted = len(await message.channel.purge(limit=count, bulk=False))
             await message.channel.send(f"🧹 Eliminé {deleted} mensaje(s).", delete_after=6)
         except ValueError:
-            await message.channel.send("Indica una cantidad entre 1 y 100; ejemplo `?purge 16`.", delete_after=8)
+            await message.channel.send("Indica un número entre 1 y 100, por ejemplo `?purge 16`.", delete_after=8)
         except (discord.Forbidden, discord.HTTPException) as error:
             await message.channel.send(f"No pude eliminar mensajes: {error}", delete_after=8)
         return
@@ -704,15 +650,15 @@ async def on_message(message):
     if content.casefold() in ("?ban", "?kick"):
         if not isinstance(message.author, discord.Member):
             return
-        ref = message.reference
-        if not ref or not ref.message_id:
-            await message.channel.send("Responde al mensaje del miembro con `?ban` o `?kick`.")
+        reference = message.reference
+        if not reference or not reference.message_id:
+            await message.channel.send("Responde al mensaje con `?ban` o `?kick`.")
             return
         try:
-            replied = ref.resolved
+            replied = reference.resolved
             if replied is None:
-                channel = message.guild.get_channel(ref.channel_id) or await client.fetch_channel(ref.channel_id)
-                replied = await channel.fetch_message(ref.message_id)
+                channel = message.guild.get_channel(reference.channel_id) or await client.fetch_channel(reference.channel_id)
+                replied = await channel.fetch_message(reference.message_id)
             target = message.guild.get_member(replied.author.id) or await message.guild.fetch_member(replied.author.id)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             await message.channel.send("No pude encontrar al miembro respondido.")
@@ -723,13 +669,13 @@ async def on_message(message):
 
     if command == "?afk":
         reason = parts[1] if len(parts) > 1 else "Sin motivo"
-        await activate_afk(message.guild.id, message.author, reason)
+        afk_users[(message.guild.id, message.author.id)] = {"started": time.time(), "reason": reason}
         await message.channel.send(f"{message.author.mention} está AFK. Motivo: {reason}", allowed_mentions=discord.AllowedMentions.none())
         return
 
-    afk = afk_users.pop((message.guild.id, message.author.id), None)
-    if afk:
-        await message.channel.send(f"{message.author.mention} salió de AFK tras {format_elapsed(time.time() - afk['started'])}.", allowed_mentions=discord.AllowedMentions.none())
+    state = afk_users.pop((message.guild.id, message.author.id), None)
+    if state:
+        await message.channel.send(f"{message.author.mention} salió de AFK tras {elapsed_label(time.time() - state['started'])}.", allowed_mentions=discord.AllowedMentions.none())
 
     if command == "?avatar":
         target = message.author
@@ -743,7 +689,7 @@ async def on_message(message):
         return
 
     if isinstance(message.author, discord.Member) and not message.author.guild_permissions.administrator:
-        normalized = normalize(message.content)
+        normalized = normalize(content)
         for word in blocked_words.get(message.guild.id, set()):
             if re.search(rf"(?<!\w){re.escape(word)}(?!\w)", normalized):
                 try:
@@ -771,6 +717,15 @@ async def on_message(message):
 
 
 @client.event
+async def on_interaction(interaction):
+    if interaction.type != discord.InteractionType.application_command or interaction.guild is None:
+        return
+    data = interaction.data or {}
+    details = f"**Usuario:** {interaction.user.mention} (`{interaction.user.id}`)\n**Comando:** `/{data.get('name', 'comando')}`\n**Canal:** {interaction.channel.mention if interaction.channel else 'desconocido'}"
+    await audit(interaction.guild, "Comando slash usado", details, discord.Color.blue())
+
+
+@client.event
 async def on_message_delete(message):
     if message.guild is None or getattr(message.author, "bot", False):
         return
@@ -781,7 +736,7 @@ async def on_message_delete(message):
 @client.event
 async def on_message_edit(before, after):
     if before.guild and not before.author.bot and before.content != after.content:
-        await audit(before.guild, "Mensaje editado", f"**Autor:** {before.author.mention}\n**Canal:** {before.channel.mention}\n**Antes:** {(before.content or '(vacío)')[:1000]}\n**Después:** {(after.content or '(vacío)')[:1000]}", discord.Color.gold())
+        await audit(before.guild, "Mensaje editado", f"**Autor:** {before.author.mention}\n**Canal:** {before.channel.mention}\n**Antes:** {(before.content or '(vacío)')[:900]}\n**Después:** {(after.content or '(vacío)')[:900]}", discord.Color.gold())
 
 
 @client.event
@@ -804,10 +759,6 @@ async def on_member_update(before, after):
         added = [role.mention for role in after.roles if role not in before.roles and not role.is_default()]
         removed = [role.mention for role in before.roles if role not in after.roles and not role.is_default()]
         await audit(after.guild, "Roles actualizados", f"**Miembro:** {after.mention}\n**Añadidos:** {', '.join(added) or 'Ninguno'}\n**Quitados:** {', '.join(removed) or 'Ninguno'}", discord.Color.gold())
-    if before.timed_out_until != after.timed_out_until:
-        executor, reason = await audit_executor(after.guild, discord.AuditLogAction.member_update, after.id)
-        until = f"<t:{int(after.timed_out_until.timestamp())}:F>" if after.timed_out_until else "Sin aislamiento"
-        await audit(after.guild, "Aislamiento actualizado", f"**Miembro:** {after.mention}\n**Hasta:** {until}\n**Moderador:** {executor.mention if executor else 'No identificado'}\n**Razón:** {reason or 'No indicada'}", discord.Color.red())
 
 
 @client.event
@@ -854,7 +805,7 @@ async def on_ready():
             invites = await guild.invites()
             invite_cache[guild.id] = {invite.code: invite.uses or 0 for invite in invites}
         except (discord.Forbidden, discord.HTTPException) as error:
-            print(f"No pude cargar invitaciones de {guild.id}: {error}")
+            print(f"No pude cargar invitaciones: {error}")
     try:
         commands = await tree.sync(guild=GUILD)
         print(f"Comandos sincronizados: {len(commands)}")
