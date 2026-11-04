@@ -6,7 +6,7 @@ from discord import app_commands
 
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("1559455132821753856")
+GUILD_ID = os.getenv("DISCORD_GUILD_ID")
 
 if not TOKEN:
     raise RuntimeError("Falta la variable DISCORD_TOKEN en Railway.")
@@ -23,8 +23,8 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# Guarda los estados AFK en memoria.
-# Se borran si el bot se reinicia.
+# Guarda usuarios AFK en memoria.
+# Se borra si el bot se reinicia.
 afk_users = {}
 
 
@@ -43,7 +43,6 @@ def formato_duracion(segundos):
 
     for nombre, cantidad in unidades:
         valor, segundos = divmod(segundos, cantidad)
-
         if valor:
             nombre_plural = nombre if valor == 1 else nombre + "s"
             resultado.append(f"{valor} {nombre_plural}")
@@ -74,7 +73,6 @@ async def afk(
     afk_users[clave] = {
         "inicio": time.time(),
         "motivo": motivo_final,
-        "nombre": interaction.user.display_name,
     }
 
     await interaction.response.send_message(
@@ -137,14 +135,11 @@ async def on_message(message: discord.Message):
         )
 
     # Si mencionan a alguien que está AFK, informa el motivo.
-    mencionados = []
-
     for usuario in message.mentions:
         clave_usuario = (message.guild.id, usuario.id)
         estado_afk = afk_users.get(clave_usuario)
 
-        if estado_afk and usuario.id not in mencionados:
-            mencionados.append(usuario.id)
+        if estado_afk:
             await message.channel.send(
                 f"{usuario.mention} está en modo AFK. "
                 f"Motivo: {estado_afk['motivo']}",
