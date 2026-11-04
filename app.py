@@ -18,8 +18,6 @@ if not TOKEN:
 
 guild = discord.Object(id=GUILD_ID)
 
-# Para ?afk y para detectar menciones/mensajes, activa también
-# Message Content Intent en Discord Developer Portal > Bot.
 intents = discord.Intents.default()
 intents.guild_messages = True
 intents.message_content = True
@@ -27,7 +25,6 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
-# Los AFK y sorteos se guardan en memoria: se reinician si se reinicia el bot.
 afk_users = {}
 
 
@@ -51,7 +48,6 @@ def formato_duracion(segundos):
 
 
 def analizar_duracion(texto):
-    """Acepta, por ejemplo: 10 minutos, 2 horas, 3 días o 1 mes."""
     texto = unicodedata.normalize("NFD", texto.strip().lower())
     texto = "".join(c for c in texto if unicodedata.category(c) != "Mn")
 
@@ -78,6 +74,14 @@ def analizar_duracion(texto):
     return cantidad
 
 
+async def activar_afk(guild_id, user, motivo):
+    clave = (guild_id, user.id)
+    afk_users[clave] = {
+        "inicio": time.time(),
+        "motivo": motivo or "Sin motivo",
+    }
+
+
 @tree.command(name="ping", description="Comprueba si el bot responde", guild=guild)
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("¡Pong! ✅")
@@ -98,18 +102,11 @@ async def ayuda(interaction: discord.Interaction):
         "• `/ping` — comprueba el bot\n"
         "• `/hola` — saluda\n"
         "• `/afk` — activa tu estado AFK\n"
-        "• `/avatar usuario` — muestra avatar y banner\n"
-        "• `/sorteo` — crea un sorteo\n"
+        "• `/avatar usuario` — muestra avatar y banner del usuario\n"
+        "• `/sorteo ganadores duracion premio` — crea un sorteo\n"
+        "• `/cookie game` — juego de galleta con cuenta atrás\n"
         "• `/anuncio mensaje` — publica un anuncio"
     )
-
-
-async def activar_afk(guild_id, user, motivo):
-    clave = (guild_id, user.id)
-    afk_users[clave] = {
-        "inicio": time.time(),
-        "motivo": motivo or "Sin motivo",
-    }
 
 
 @tree.command(name="afk", description="Activa tu estado AFK", guild=guild)
@@ -134,15 +131,6 @@ async def afk_slash(
     )
 
 
-@tree.command(name="avatar", description="Muestra el avatar y banner de un miembro", guild=guild)
-@app_commands.describe(usuario="Miembro cuyo avatar y banner quieres ver")
-async def avatar_slash(
-    interaction: discord.Interaction,
-    usuario: discord.Member,
-):
-    await enviar_avatar(interaction, usuario)
-
-
 async def enviar_avatar(interaction, usuario):
     try:
         usuario_completo = await client.fetch_user(usuario.id)
@@ -164,6 +152,15 @@ async def enviar_avatar(interaction, usuario):
     await interaction.response.send_message(embed=embed)
 
 
+@tree.command(name="avatar", description="Muestra el avatar y banner de un miembro", guild=guild)
+@app_commands.describe(usuario="Miembro cuyo avatar y banner quieres ver")
+async def avatar_slash(
+    interaction: discord.Interaction,
+    usuario: discord.Member,
+):
+    await enviar_avatar(interaction, usuario)
+
+
 class SorteoView(discord.ui.View):
     def __init__(self, premio, cantidad_ganadores, duracion):
         super().__init__(timeout=None)
@@ -174,6 +171,7 @@ class SorteoView(discord.ui.View):
         self.mensaje = None
         self.canal = None
         self.finalizado = False
+        self.lock = asyncio.Lock()
 
     def crear_embed(self, finalizado=False, ganadores=None):
         embed = discord.Embed(
@@ -181,16 +179,8 @@ class SorteoView(discord.ui.View):
             description=f"**Premio:** {self.premio}",
             color=discord.Color.blurple(),
         )
-        embed.add_field(
-            name="Ganadores",
-            value=str(self.cantidad_ganadores),
-            inline=True,
-        )
-        embed.add_field(
-            name="Participantes",
-            value=str(len(self.participantes)),
-            inline=True,
-        )
+        embed.add_field(name="Ganadores", value=str(self.cantidad_ganadores), inline=True)
+        embed.add_field(name="Participantes", value=str(len(self.participantes)), inline=True)
 
         if finalizado:
             if ganadores:
@@ -200,11 +190,7 @@ class SorteoView(discord.ui.View):
                     inline=False,
                 )
             else:
-                embed.add_field(
-                    name="Resultado",
-                    value="No hubo participantes.",
-                    inline=False,
-                )
+                embed.add_field(name="Resultado", value="No hubo participantes.", inline=False)
         else:
             embed.add_field(
                 name="Cómo participar",
@@ -224,25 +210,26 @@ class SorteoView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ):
-        if self.finalizado:
-            await interaction.response.send_message(
-                "Este sorteo ya terminó.",
-                ephemeral=True,
-            )
-            return
+        async with self.lock:
+            if self.finalizado:
+                await interaction.response.send_message(
+                    "Este sorteo ya terminó.",
+                    ephemeral=True,
+                )
+                return
 
-        user_id = interaction.user.id
-        if user_id in self.participantes:
-            self.participantes.remove(user_id)
-            respuesta = "Saliste del sorteo."
-        else:
-            self.participantes.add(user_id)
-            respuesta = "¡Ya estás participando!"
+            user_id = interaction.user.id
+            if user_id in self.participantes:
+                self.participantes.remove(user_id)
+                respuesta = "Saliste del sorteo."
+            else:
+                self.participantes.add(user_id)
+                respuesta = "¡Ya estás participando!"
 
-        await interaction.response.send_message(respuesta, ephemeral=True)
+            await interaction.response.send_message(respuesta, ephemeral=True)
 
-        if self.mensaje:
-            await self.mensaje.edit(embed=self.crear_embed(), view=self)
+            if self.mensaje:
+                await self.mensaje.edit(embed=self.crear_embed(), view=self)
 
     async def terminar(self):
         await asyncio.sleep(self.duracion)
@@ -275,8 +262,8 @@ class SorteoView(discord.ui.View):
 @tree.command(name="sorteo", description="Crea un sorteo en este canal", guild=guild)
 @app_commands.describe(
     ganadores="Cantidad de ganadores, entre 1 y 10",
-    duracion="Por ejemplo: 10 minutos, 2 horas, 3 días o 1 mes",
-    premio="Premio del sorteo; opcional",
+    duracion="Ejemplo: 10 minutos, 2 horas, 3 días o 1 mes",
+    premio="Premio opcional del sorteo",
 )
 async def sorteo(
     interaction: discord.Interaction,
@@ -287,8 +274,7 @@ async def sorteo(
     segundos = analizar_duracion(duracion)
     if segundos is None:
         await interaction.response.send_message(
-            "Duración no válida. Usa, por ejemplo: `10 minutos`, `2 horas`, "
-            "`3 días` o `1 mes`.",
+            "Duración no válida. Usa, por ejemplo: `10 minutos`, `2 horas`, `3 días` o `1 mes`.",
             ephemeral=True,
         )
         return
@@ -310,6 +296,88 @@ async def sorteo(
     )
     vista.mensaje = await interaction.original_response()
     asyncio.create_task(vista.terminar())
+
+
+class CookieGameView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=120)
+        self.started = False
+        self.finished = False
+        self.lock = asyncio.Lock()
+
+        self.message = None
+        self.winner = None
+
+        self.button = discord.ui.Button(
+            label="🍪",
+            style=discord.ButtonStyle.success,
+            disabled=True,
+        )
+        self.add_item(self.button)
+
+        self.button.callback = self.inc_button
+
+    async def inc_button(self, interaction: discord.Interaction):
+        async with self.lock:
+            if self.finished:
+                await interaction.response.send_message(
+                    "Alguien ya tocó la galleta y ganó.",
+                    ephemeral=True,
+                )
+                return
+
+            if not self.started:
+                await interaction.response.send_message(
+                    "¡Espera a que la cuenta regresiva llegue a 0!",
+                    ephemeral=True,
+                )
+                return
+
+            self.finished = True
+            self.winner = interaction.user
+            self.button.disabled = True
+
+            await interaction.response.edit_message(
+                content=f"🍪 {interaction.user.mention} tocó la galleta primero y ganó.",
+                view=self,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+    async def start(self):
+        for cuenta in range(5, -1, -1):
+            if cuenta == 0:
+                self.started = True
+                self.button.disabled = False
+                await self.message.edit(
+                    content="🍪 ¡La galleta apareció! **0** — ¡púlsala primero!",
+                    view=self,
+                )
+            else:
+                await self.message.edit(
+                    content=f"🍪 La galleta aparece en **{cuenta}**…",
+                    view=self,
+                )
+            await asyncio.sleep(1)
+
+        await asyncio.sleep(1)
+        if not self.finished:
+            self.finished = True
+            self.button.disabled = True
+            await self.message.edit(
+                content="⏰ Se acabó el tiempo: nadie tocó la galleta.",
+                view=self,
+            )
+
+
+@tree.command(name="cookie", description="Juego de la cookie", guild=guild)
+async def cookie_game(interaction: discord.Interaction):
+    vista = CookieGameView()
+    await interaction.response.send_message(
+        "🍪 La galleta aparece en **5**…",
+        view=vista,
+    )
+    vista.message = await interaction.original_response()
+    asyncio.create_task(vista.start())
 
 
 @tree.command(name="anuncio", description="Envía un anuncio importante", guild=guild)
@@ -347,7 +415,6 @@ async def on_message(message: discord.Message):
     partes = contenido.split(maxsplit=1)
     comando = partes[0].lower() if partes else ""
 
-    # Comando de texto: ?afk o ?afk durmiendo
     if comando == "?afk":
         motivo = partes[1].strip() if len(partes) > 1 else "Sin motivo"
         await activar_afk(message.guild.id, message.author, motivo)
@@ -357,20 +424,16 @@ async def on_message(message: discord.Message):
         )
         return
 
-    # Si vuelve a escribir, termina su estado AFK.
     clave_autor = (message.guild.id, message.author.id)
     estado = afk_users.pop(clave_autor, None)
 
     if estado:
         tiempo = formato_duracion(time.time() - estado["inicio"])
         await message.channel.send(
-            f"{message.author.mention} salió de su estado AFK "
-            f"y llevaba {tiempo}.",
+            f"{message.author.mention} salió de su estado AFK y llevaba {tiempo}.",
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
-    # ?avatar muestra el autor del mensaje al que se respondió;
-    # si no es una respuesta, muestra al usuario que escribió ?avatar.
     if comando == "?avatar":
         usuario_objetivo = message.author
         referencia = message.reference
@@ -406,17 +469,12 @@ async def on_message(message: discord.Message):
         await message.channel.send(embed=embed)
         return
 
-    # Avisa si mencionan a alguien que está AFK.
-    usuarios_avisados = set()
     for usuario in message.mentions:
         clave_usuario = (message.guild.id, usuario.id)
         estado_afk = afk_users.get(clave_usuario)
-
-        if estado_afk and usuario.id not in usuarios_avisados:
-            usuarios_avisados.add(usuario.id)
+        if estado_afk:
             await message.channel.send(
-                f"{usuario.mention} está en modo AFK. "
-                f"Motivo: {estado_afk['motivo']}",
+                f"{usuario.mention} está en modo AFK. Motivo: {estado_afk['motivo']}",
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
